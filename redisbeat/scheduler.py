@@ -103,6 +103,7 @@ class RedisScheduler(Scheduler):
         self.rdb.zrem(self.key, task_key)
 
     def tick(self):
+        """重写了tick"""
         if not self.rdb.exists(self.key):
             logger.warn("key: {} not in rdb".format(self.key))
             for e in values(self.schedule):
