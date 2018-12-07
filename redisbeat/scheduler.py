@@ -31,10 +31,12 @@ except AttributeError:
 class RedisScheduler(Scheduler):
     def __init__(self, *args, **kwargs):
         app = kwargs['app']
+        # 存储到 redis 的键
         self.key = app.conf.get("CELERY_REDIS_SCHEDULER_KEY",
                                 "celery:beat:order_tasks")
         self.schedule_url = app.conf.get("CELERY_REDIS_SCHEDULER_URL",
                                          "redis://localhost:6379")
+        # 这里开始创建Redis连接（？）
         self.rdb = StrictRedis.from_url(self.schedule_url)
         Scheduler.__init__(self, *args, **kwargs)
         app.add_task = partial(self.add, self)
@@ -52,9 +54,13 @@ class RedisScheduler(Scheduler):
         self.rdb.delete(self.key)
 
     def _when(self, entry, next_time_to_run):
+        """生成下一次调度的时间，override
+        now + second
+        """
         return mktime(entry.schedule.now().timetuple()) + (self.adjust(next_time_to_run) or 0)
 
     def setup_schedule(self):
+        """override"""
         # init entries
         self.merge_inplace(self.app.conf.CELERYBEAT_SCHEDULE)
         tasks = self.rdb.zrangebyscore(self.key, 0, -1)
@@ -62,24 +68,33 @@ class RedisScheduler(Scheduler):
             repr(pickle.loads(entry)) for entry in tasks))
 
     def merge_inplace(self, tasks):
+        """override"""
+        # 从 redis 中获取entry
         old_entries = self.rdb.zrangebyscore(self.key, 0, MAXINT, withscores=True)
         old_entries_dict = dict({})
+        # 遍历 old_entries 并缓存起来
         for task, score in old_entries:
             entry = pickle.loads(task)
             old_entries_dict[entry.name] = (entry, score)
         debug("old_entries: {}".format(old_entries_dict))
 
+        # 删除数据库
         self.rdb.delete(self.key)
 
+        # 遍历传入的 tasks
         for key in tasks:
             last_run_at = 0
             e = self.Entry(**dict(tasks[key], name=key, app=self.app))
+            # new task 替换 old task
             if key in old_entries_dict:
                 # replace entry and remain old score
                 last_run_at = old_entries_dict[key][1]
                 del old_entries_dict[key]
+            # 添加进 redis
             self.rdb.zadd(self.key, min(last_run_at, self._when(e, e.is_due()[1]) or 0), pickle.dumps(e))
         debug("old_entries: {}".format(old_entries_dict))
+
+        # 遍历 old_entries ，打印信息
         for key, tasks in old_entries_dict.items():
             debug("key: {}".format(key))
             debug("tasks: {}".format(tasks))
@@ -87,27 +102,36 @@ class RedisScheduler(Scheduler):
         debug(self.rdb.zrange(self.key, 0, -1))
 
     def is_due(self, entry):
+        """override"""
         return entry.is_due()
 
     def adjust(self, n, drift=-0.010):
+        """override"""
         if n and n > 0:
             return n + drift
         return n
 
     def add(self, **kwargs):
+        """添加任务"""
         e = self.Entry(app=current_app, **kwargs)
         self.rdb.zadd(self.key, self._when(e, e.is_due()[1]) or 0, pickle.dumps(e))
         return True
 
     def remove(self, task_key):
+        """移除任务"""
         self.rdb.zrem(self.key, task_key)
 
     def tick(self):
+        """override
+
+        使用了 Redis 的有序集合进行排序
+        """
         if not self.rdb.exists(self.key):
             logger.warn("key: {} not in rdb".format(self.key))
             for e in values(self.schedule):
                 self.rdb.zadd(self.key, self._when(e, e.is_due()[1]) or 0, pickle.dumps(e))
 
+        # 从 redis 获取所有tasks
         tasks = self.rdb.zrangebyscore(
             self.key, 0,
             self.adjust(mktime(self.app.now().timetuple()), drift=0.010),
@@ -123,6 +147,7 @@ class RedisScheduler(Scheduler):
             if is_due:
                 next_entry = self.reserve(entry)
                 try:
+                    # 调度任务
                     linfo("add task entry: {} to publisher".format(entry.name))
                     result = self.apply_async(entry)
                 except Exception as exc:
@@ -140,9 +165,11 @@ class RedisScheduler(Scheduler):
         entry = pickle.loads(next_task[0][0])
         next_times.append(self.is_due(entry)[1])
 
+        # 取最小值后返回
         return min(next_times)
 
     def close(self):
+        """override"""
         # it would be call after cycle end
         if self.multi_node:
             try:
@@ -153,5 +180,6 @@ class RedisScheduler(Scheduler):
 
     @property
     def info(self):
+        """override"""
         # return infomation about Schedule
         return '    . db -> {self.schedule_url}, key -> {self.key}'.format(self=self)
